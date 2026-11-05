@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  webrag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webrag_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_DIR=/app/data
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.1
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: webrag_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
+volumes:
+  ollama_models:

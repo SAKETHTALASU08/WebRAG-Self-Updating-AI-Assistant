@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRAG — Self-Updating Local AI Assistant</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Sidebar: Knowledge Bases -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <div class="brand-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+          </div>
+          <div>
+            <h1 class="brand-title">WebRAG</h1>
+            <span class="brand-badge" id="ollama-status-badge">Connecting...</span>
+          </div>
+        </div>
+        <button class="btn btn-primary btn-sm btn-block" id="btn-open-create-modal">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          Add Website
+        </button>
+      </div>
+
+      <div class="sidebar-section-title">Knowledge Bases</div>
+      <div class="site-list" id="site-list">
+        <div class="empty-hint">Loading sites...</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="local-pill">
+          <span class="status-dot green"></span>
+          <span>100% Local &bull; No External APIs</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-panel">
+      <!-- Site Selected State -->
+      <div id="site-view" class="site-view hidden">
+        <!-- Site Header & Stats -->
+        <header class="panel-header">
+          <div class="site-info">
+            <div class="site-title-row">
+              <h2 id="current-site-name" class="site-heading">Select a site</h2>
+              <span id="current-site-status" class="status-chip">Idle</span>
+            </div>
+            <a id="current-site-url" href="#" target="_blank" rel="noopener" class="site-root-url"></a>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-secondary btn-sm" id="btn-inspect-chunks" title="Inspect chunk hashes and text">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+              </svg>
+              Inspect Chunks
+            </button>
+            <button class="btn btn-primary btn-sm" id="btn-recrawl" title="Run incremental crawl (SHA-256 chunk update)">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <polyline points="1 20 1 14 7 14"></polyline>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+              </svg>
+              Incremental Update
+            </button>
+            <button class="btn btn-danger btn-sm" id="btn-delete-site" title="Delete knowledge base">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- Stats Bar -->
+        <div class="stats-row">
+          <div class="stat-card">
+            <div class="stat-label">Total Pages</div>
+            <div class="stat-value" id="stat-total-pages">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Vector Chunks</div>
+            <div class="stat-value" id="stat-total-chunks">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Last Crawl</div>
+            <div class="stat-value small" id="stat-last-crawled">Never</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Change Detection</div>
+            <div class="stat-value small highlight" id="stat-incremental-info">SHA-256 Active</div>
+          </div>
+        </div>
+
+        <!-- Live Crawl Progress Banner -->
+        <div id="crawl-progress-banner" class="crawl-banner hidden">
+          <div class="banner-spinner"></div>
+          <div class="banner-text">
+            <div class="banner-title" id="crawl-banner-title">Crawling website...</div>
+            <div class="banner-sub" id="crawl-banner-url">Scanning URL...</div>
+          </div>
+          <div class="banner-metrics" id="crawl-banner-metrics">0 / 0 pages</div>
+        </div>
+
+        <!-- Chat / Query Interface -->
+        <div class="chat-container">
+          <div class="chat-messages" id="chat-messages">
+            <div class="assistant-welcome">
+              <div class="welcome-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </div>
+              <h3>Ask anything about this website</h3>
+              <p>Every response answers strictly from the indexed pages and cites its source URLs.</p>
+            </div>
+          </div>
+
+          <!-- Chat Input -->
+          <div class="chat-input-wrapper">
+            <div class="input-controls">
+              <span class="control-label">Retriever: Top 5 Chunks</span>
+              <span class="control-label" id="model-tag">Model: Ollama Llama 3.1</span>
+            </div>
+            <form id="chat-form" class="chat-form">
+              <textarea
+                id="query-input"
+                class="chat-textarea"
+                rows="1"
+                placeholder="Ask a question about this website..."
+                required
+              ></textarea>
+              <button type="submit" class="btn btn-send" id="btn-send">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Empty State -->
+      <div id="no-site-selected" class="empty-state">
+        <div class="empty-illustration">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="2" y1="12" x2="22" y2="12"></line>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+          </svg>
+        </div>
+        <h2>No Knowledge Base Selected</h2>
+        <p>Choose an existing website from the sidebar or index a new website root URL to start.</p>
+        <button class="btn btn-primary" id="btn-empty-add">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          Add Website Root URL
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <!-- Create Site Modal -->
+  <div class="modal-overlay hidden" id="create-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Index New Website</h3>
+        <button class="btn-close" id="btn-close-create-modal">&times;</button>
+      </div>
+      <form id="create-site-form">
+        <div class="form-group">
+          <label for="input-root-url">Root URL <span class="required">*</span></label>
+          <input
+            type="url"
+            id="input-root-url"
+            class="form-control"
+            placeholder="https://example.com"
+            required
+          />
+          <small class="form-hint">Crawler stays strictly within this domain.</small>
+        </div>
+        <div class="form-group">
+          <label for="input-site-name">Friendly Name (Optional)</label>
+          <input
+            type="text"
+            id="input-site-name"
+            class="form-control"
+            placeholder="e.g. Acme Docs"
+          />
+        </div>
+        <div class="form-row">
+          <div class="form-group col">
+            <label for="input-max-depth">Max Depth</label>
+            <input type="number" id="input-max-depth" class="form-control" value="3" min="1" max="10"/>
+          </div>
+          <div class="form-group col">
+            <label for="input-max-pages">Max Pages</label>
+            <input type="number" id="input-max-pages" class="form-control" value="50" min="1" max="500"/>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-create">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-create">Start Indexing</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Inspect Chunks Modal -->
+  <div class="modal-overlay hidden" id="chunks-modal">
+    <div class="modal-card modal-large">
+      <div class="modal-header">
+        <h3>Vector Chunks &amp; SHA-256 Hashes</h3>
+        <button class="btn-close" id="btn-close-chunks-modal">&times;</button>
+      </div>
+      <div class="modal-body-scroll" id="chunks-container">
+        <div class="empty-hint">Loading chunks...</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
