@@ -25,6 +25,8 @@ class CrawlItem(NamedTuple):
     raw_bytes: bytes
     etag: Optional[str] = None
     last_modified: Optional[str] = None
+    status_code: int = 200
+    is_modified: bool = True
 
 
 class WebCrawler:
@@ -56,6 +58,7 @@ class WebCrawler:
         user_agent: Optional[str] = None,
         allow_subdomains: bool = False,
         session: Optional[requests.Session] = None,
+        known_headers: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     ):
         self.raw_root_url = root_url.strip()
         self.root_url = self.normalize_url(self.raw_root_url, self.raw_root_url) or self.raw_root_url
@@ -72,6 +75,10 @@ class WebCrawler:
         self.backoff_factor = backoff_factor
         self.user_agent = user_agent or settings.USER_AGENT
         self.allow_subdomains = allow_subdomains
+
+        # Stored headers for conditional requests: url -> {"etag": ..., "last_modified": ...}
+        self.known_headers: Dict[str, Dict[str, Optional[str]]] = dict(known_headers or {})
+        self.pages_skipped_304: int = 0
 
         # Tracking sets
         self.visited_urls: Set[str] = set()
@@ -265,18 +272,24 @@ class WebCrawler:
 
     def crawl_items(
         self,
-        on_page_crawled: Optional[Callable[[str, int, int], None]] = None
+        on_page_crawled: Optional[Callable[[str, int, int], None]] = None,
+        known_headers: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     ) -> List[CrawlItem]:
         """
         Execute BFS crawling and return list of CrawlItem records containing
-        (url, content_type, raw_bytes, etag, last_modified).
+        (url, content_type, raw_bytes, etag, last_modified, status_code, is_modified).
+        Uses conditional headers (If-None-Match, If-Modified-Since) to skip unchanged resources.
         """
+        if known_headers:
+            self.known_headers.update(known_headers)
+
         results: List[CrawlItem] = []
         queue: deque = deque([(self.root_url, 0)])
         
         self.visited_urls.clear()
         self.enqueued_urls.clear()
         self.headers_store.clear()
+        self.pages_skipped_304 = 0
         self.enqueued_urls.add(self.root_url)
 
         pages_crawled_count = 0
@@ -295,12 +308,52 @@ class WebCrawler:
                 # Apply rate limiting
                 self._apply_rate_limit()
 
+                # Build conditional request headers if ETag or Last-Modified are stored
+                req_headers: Dict[str, str] = {}
+                stored_meta = self.known_headers.get(current_url)
+                if stored_meta:
+                    if stored_meta.get("etag"):
+                        req_headers["If-None-Match"] = str(stored_meta["etag"])
+                    if stored_meta.get("last_modified"):
+                        req_headers["If-Modified-Since"] = str(stored_meta["last_modified"])
+
                 # Fetch resource
                 resp = self.session.get(
                     current_url,
+                    headers=req_headers if req_headers else None,
                     timeout=self.timeout,
                     allow_redirects=True,
                 )
+
+                # 304 Not Modified: page unchanged, skip downloading & parsing
+                if resp.status_code == 304:
+                    self.pages_skipped_304 += 1
+                    etag = resp.headers.get("ETag") or resp.headers.get("etag") or (stored_meta.get("etag") if stored_meta else None)
+                    last_mod = resp.headers.get("Last-Modified") or resp.headers.get("last-modified") or (stored_meta.get("last_modified") if stored_meta else None)
+                    self.headers_store[current_url] = {
+                        "etag": etag,
+                        "last_modified": last_mod,
+                    }
+                    item = CrawlItem(
+                        url=current_url,
+                        content_type="not_modified",
+                        raw_bytes=b"",
+                        etag=etag,
+                        last_modified=last_mod,
+                        status_code=304,
+                        is_modified=False,
+                    )
+                    results.append(item)
+                    logger.info(f"Conditional request: {current_url} unchanged (HTTP 304 Not Modified)")
+
+                    # If page is 304, ensure known child URLs from previous crawl are enqueued if within max_depth
+                    if depth < self.max_depth and self.known_headers:
+                        for known_url in self.known_headers:
+                            if known_url not in self.visited_urls and known_url not in self.enqueued_urls:
+                                if self.should_crawl(known_url):
+                                    self.enqueued_urls.add(known_url)
+                                    queue.append((known_url, depth + 1))
+                    continue
 
                 if resp.status_code != 200:
                     logger.warning(f"Failed to fetch {current_url}: status {resp.status_code}")
@@ -333,6 +386,8 @@ class WebCrawler:
                     raw_bytes=raw_bytes,
                     etag=etag,
                     last_modified=last_modified,
+                    status_code=200,
+                    is_modified=True,
                 )
                 results.append(item)
 
@@ -356,23 +411,28 @@ class WebCrawler:
 
     def crawl(
         self,
-        on_page_crawled: Optional[Callable[[str, int, int], None]] = None
+        on_page_crawled: Optional[Callable[[str, int, int], None]] = None,
+        known_headers: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     ) -> List[Tuple[str, str, bytes]]:
         """
         Execute crawling and output a list of (url, content_type, raw_bytes).
         """
-        items = self.crawl_items(on_page_crawled=on_page_crawled)
+        items = self.crawl_items(on_page_crawled=on_page_crawled, known_headers=known_headers)
         return [(item.url, item.content_type, item.raw_bytes) for item in items]
 
     def crawl_documents(
         self,
-        on_page_crawled: Optional[Callable[[str, int, int], None]] = None
+        on_page_crawled: Optional[Callable[[str, int, int], None]] = None,
+        known_headers: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     ) -> Generator[ExtractedDocument, None, None]:
         """
         Generator yielding ExtractedDocument objects for direct integration with WebRAG pipeline.
+        Skips 304 Not Modified pages automatically.
         """
-        items = self.crawl_items(on_page_crawled=on_page_crawled)
+        items = self.crawl_items(on_page_crawled=on_page_crawled, known_headers=known_headers)
         for item in items:
+            if not item.is_modified or item.status_code == 304:
+                continue
             try:
                 if item.content_type == "application/pdf":
                     doc = ContentExtractor.extract_pdf(item.url, item.raw_bytes)
@@ -381,4 +441,5 @@ class WebCrawler:
                 if doc and doc.raw_text.strip():
                     yield doc
             except Exception as e:
+                logger.error(f"Error extracting document for {item.url}: {e}")
                 logger.error(f"Error extracting document for {item.url}: {e}")

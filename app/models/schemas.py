@@ -24,12 +24,33 @@ class SiteSummary(BaseModel):
 class CrawlStats(BaseModel):
     pages_discovered: int = 0
     pages_crawled: int = 0
+    pages_skipped_304: int = 0
     pages_unchanged: int = 0
     pages_updated: int = 0
     chunks_added: int = 0
     chunks_unchanged: int = 0
     chunks_removed: int = 0
     duration_seconds: float = 0.0
+    time_saved_seconds: float = 0.0
+    status: str = "completed"
+    error: Optional[str] = None
+
+
+class CrawlSummaryReport(BaseModel):
+    site_id: str
+    root_url: str
+    pages_discovered: int = 0
+    pages_crawled: int = 0
+    pages_skipped_304: int = 0
+    pages_unchanged: int = 0
+    pages_updated: int = 0
+    chunks_added: int = 0
+    chunks_unchanged: int = 0
+    chunks_removed: int = 0
+    total_active_chunks: int = 0
+    total_active_pages: int = 0
+    duration_seconds: float = 0.0
+    time_saved_seconds: float = 0.0
     status: str = "completed"
     error: Optional[str] = None
 

@@ -1,10 +1,13 @@
+from datetime import datetime, timezone
 import logging
 import time
-from typing import AsyncGenerator, Dict, Generator, List, Optional, Tuple
+from typing import AsyncGenerator, Callable, Dict, Generator, List, Optional, Tuple
 
+import requests
 from app.config import settings
-from app.crawler.extractor import ExtractedDocument
-from app.models.schemas import Citation, CrawlStats, QueryResponse
+from app.crawler.crawler import CrawlItem, WebCrawler
+from app.crawler.extractor import ContentExtractor, ExtractedDocument
+from app.models.schemas import Citation, CrawlStats, CrawlSummaryReport, QueryResponse
 from app.rag.chunker import DocumentChunk, IncrementalChunker
 from app.rag.embedder import LocalEmbedder
 from app.rag.ollama_client import OllamaClient
@@ -32,9 +35,16 @@ class RagPipeline:
         self,
         site_id: str,
         doc: ExtractedDocument,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
     ) -> Tuple[int, int, int]:
         """
         Incrementally index a crawled document using SHA-256 chunk hashing.
+        Diffs new chunk hashes against stored ones:
+        - Classifies chunks into unchanged, new, or removed
+        - Embeds ONLY new chunks
+        - Deletes removed chunks from SQLite and FAISS
+        - Skips unchanged chunks
         Returns: (chunks_added, chunks_unchanged, chunks_removed)
         """
         db = self.site_manager.get_database(site_id)
@@ -43,6 +53,14 @@ class RagPipeline:
         # 1. Chunk document
         new_chunks = self.chunker.chunk_document(doc)
         if not new_chunks:
+            # If page is now empty, delete any previously stored chunks for this URL
+            existing_chunks = db.get_existing_chunk_hashes_for_url(doc.url)
+            if existing_chunks:
+                stale_ids = [row["id"] for row in existing_chunks.values()]
+                removed_faiss_ids = db.delete_chunks_by_ids(stale_ids)
+                vector_store.remove(removed_faiss_ids)
+                logger.info(f"Page became empty: removed {len(removed_faiss_ids)} chunks for {doc.url}")
+                return (0, 0, len(removed_faiss_ids))
             return (0, 0, 0)
 
         # 2. Get existing chunks for this URL
@@ -78,6 +96,8 @@ class RagPipeline:
         page_hash = hashlib.sha256(doc.raw_text.encode("utf-8")).hexdigest()
         db.upsert_page(
             url=doc.url,
+            etag=etag,
+            last_modified=last_modified,
             title=doc.title,
             content_type=doc.content_type,
             page_hash=page_hash,
@@ -114,9 +134,206 @@ class RagPipeline:
 
             vector_store.add(assigned_faiss_ids, vectors)
             chunks_added = len(chunks_to_embed)
-            logger.info(f"Embedded and saved {chunks_added} new chunks for {doc.url}")
+            logger.info(
+                f"Embedded and saved {chunks_added} new chunks for {doc.url} "
+                f"({chunks_unchanged} skipped as unchanged)"
+            )
 
+        logger.info(
+            f"Chunk diff summary for {doc.url}: {chunks_added} new/embedded, "
+            f"{chunks_unchanged} unchanged/skipped, {chunks_removed} removed"
+        )
         return (chunks_added, chunks_unchanged, chunks_removed)
+
+    def crawl_and_index_site(
+        self,
+        site_id: str,
+        max_depth: Optional[int] = None,
+        max_pages: Optional[int] = None,
+        delay_seconds: Optional[float] = None,
+        on_progress: Optional[Callable[[str, int, int], None]] = None,
+        session: Optional[requests.Session] = None,
+    ) -> CrawlSummaryReport:
+        """
+        Execute full incremental re-crawl and re-indexing:
+        - Sends conditional requests (ETag / Last-Modified) using stored SQLite page headers
+        - Skips unchanged pages (HTTP 304 Not Modified)
+        - Diffs chunk hashes for crawled pages (200 OK)
+        - Embeds only new chunks, deletes removed ones from FAISS & SQLite, skips unchanged
+        - Logs counts and estimated time saved
+        - Persists crawl run stats to SQLite
+        - Returns structured CrawlSummaryReport
+        """
+        meta = self.site_manager.read_metadata(site_id)
+        if not meta:
+            raise ValueError(f"Site '{site_id}' not found.")
+        root_url = meta["root_url"]
+        db = self.site_manager.get_database(site_id)
+        vector_store = self.site_manager.get_vector_store(site_id)
+
+        # 1. Retrieve stored conditional headers (ETag / Last-Modified) from SQLite
+        known_headers = db.get_all_pages_headers()
+
+        # 2. Configure crawler
+        rate_delay = delay_seconds if delay_seconds is not None else settings.CRAWL_DELAY_SECONDS
+        crawler = WebCrawler(
+            root_url=root_url,
+            max_depth=max_depth or meta.get("max_depth", settings.MAX_CRAWL_DEPTH),
+            max_pages=max_pages or meta.get("max_pages", settings.MAX_CRAWL_PAGES),
+            rate_limit_delay=rate_delay,
+            known_headers=known_headers,
+            session=session,
+        )
+
+        start_time = time.time()
+        run_id = db.record_crawl_start()
+        meta["status"] = "crawling"
+        self.site_manager.write_metadata(site_id, meta)
+
+        pages_crawled_count = 0
+        pages_skipped_304 = 0
+        pages_updated_count = 0
+        pages_unchanged_count = 0
+        total_chunks_added = 0
+        total_chunks_unchanged = 0
+        total_chunks_removed = 0
+        total_embed_time = 0.0
+
+        try:
+            items = crawler.crawl_items(on_page_crawled=on_progress)
+
+            for item in items:
+                # HTTP 304: page unchanged via conditional headers
+                if not item.is_modified or item.status_code == 304:
+                    pages_skipped_304 += 1
+                    pages_unchanged_count += 1
+                    existing_chunks = db.get_existing_chunk_hashes_for_url(item.url)
+                    total_chunks_unchanged += len(existing_chunks)
+                    db.touch_page(item.url)
+                    logger.info(
+                        f"Skipped unchanged page (304 Not Modified): {item.url} "
+                        f"({len(existing_chunks)} chunks preserved)"
+                    )
+                    continue
+
+                pages_crawled_count += 1
+                try:
+                    if item.content_type == "application/pdf":
+                        doc = ContentExtractor.extract_pdf(item.url, item.raw_bytes)
+                    else:
+                        doc = ContentExtractor.extract_html(item.url, item.raw_bytes)
+                    if not doc or not doc.raw_text.strip():
+                        continue
+
+                    t_embed_0 = time.time()
+                    added, unchanged, removed = self.process_document_incremental(
+                        site_id=site_id,
+                        doc=doc,
+                        etag=item.etag,
+                        last_modified=item.last_modified,
+                    )
+                    if added > 0:
+                        total_embed_time += (time.time() - t_embed_0)
+
+                    total_chunks_added += added
+                    total_chunks_unchanged += unchanged
+                    total_chunks_removed += removed
+
+                    if added > 0 or removed > 0:
+                        pages_updated_count += 1
+                    else:
+                        pages_unchanged_count += 1
+
+                except Exception as e:
+                    logger.error(f"Error processing document for {item.url}: {e}", exc_info=True)
+
+            # Compute estimated time saved
+            # 1. Embedding time saved: avoided embedding unchanged chunks
+            if total_chunks_added > 0 and total_embed_time > 0:
+                avg_embed_per_chunk = total_embed_time / total_chunks_added
+            else:
+                avg_embed_per_chunk = 0.025  # standard local embedding latency per chunk on CPU
+            embed_time_saved = total_chunks_unchanged * avg_embed_per_chunk
+
+            # 2. Network transfer & DOM parsing time saved for 304 pages
+            network_time_saved = pages_skipped_304 * 0.15
+            time_saved_seconds = round(embed_time_saved + network_time_saved, 3)
+            duration_seconds = round(time.time() - start_time, 3)
+
+            # Log counts and time saved
+            logger.info(
+                f"=== Re-Crawl Summary Report for site '{site_id}' ===\n"
+                f"  Root URL: {root_url}\n"
+                f"  Duration: {duration_seconds}s | Estimated Time Saved: {time_saved_seconds}s\n"
+                f"  Pages Discovered: {len(crawler.visited_urls)}\n"
+                f"  Pages Crawled (200): {pages_crawled_count} | Skipped (304 Not Modified): {pages_skipped_304}\n"
+                f"  Pages Updated: {pages_updated_count} | Pages Unchanged: {pages_unchanged_count}\n"
+                f"  Chunks Added (New): {total_chunks_added} (embedded)\n"
+                f"  Chunks Unchanged: {total_chunks_unchanged} (skipped embedding)\n"
+                f"  Chunks Removed: {total_chunks_removed} (deleted from SQLite & FAISS)\n"
+                f"  Total Active Chunks in FAISS: {vector_store.total_vectors}"
+            )
+
+            # Record crawl finish in SQLite
+            db.record_crawl_finish(
+                run_id=run_id,
+                pages_discovered=len(crawler.visited_urls),
+                pages_crawled=pages_crawled_count + pages_skipped_304,
+                pages_unchanged=pages_unchanged_count,
+                pages_updated=pages_updated_count,
+                chunks_added=total_chunks_added,
+                chunks_unchanged=total_chunks_unchanged,
+                chunks_removed=total_chunks_removed,
+                pages_skipped_304=pages_skipped_304,
+                duration_seconds=duration_seconds,
+                time_saved_seconds=time_saved_seconds,
+                status="completed",
+            )
+
+            meta["status"] = "idle"
+            meta["last_crawled_at"] = datetime.now(timezone.utc).isoformat()
+            self.site_manager.write_metadata(site_id, meta)
+
+            stats = db.get_stats()
+            return CrawlSummaryReport(
+                site_id=site_id,
+                root_url=root_url,
+                pages_discovered=len(crawler.visited_urls),
+                pages_crawled=pages_crawled_count,
+                pages_skipped_304=pages_skipped_304,
+                pages_unchanged=pages_unchanged_count,
+                pages_updated=pages_updated_count,
+                chunks_added=total_chunks_added,
+                chunks_unchanged=total_chunks_unchanged,
+                chunks_removed=total_chunks_removed,
+                total_active_chunks=stats["total_chunks"],
+                total_active_pages=stats["total_pages"],
+                duration_seconds=duration_seconds,
+                time_saved_seconds=time_saved_seconds,
+                status="completed",
+            )
+
+        except Exception as e:
+            duration_seconds = round(time.time() - start_time, 3)
+            logger.error(f"Error during crawl and index for {site_id}: {e}", exc_info=True)
+            db.record_crawl_finish(
+                run_id=run_id,
+                pages_discovered=len(crawler.visited_urls),
+                pages_crawled=pages_crawled_count,
+                pages_unchanged=pages_unchanged_count,
+                pages_updated=pages_updated_count,
+                chunks_added=total_chunks_added,
+                chunks_unchanged=total_chunks_unchanged,
+                chunks_removed=total_chunks_removed,
+                pages_skipped_304=pages_skipped_304,
+                duration_seconds=duration_seconds,
+                time_saved_seconds=0.0,
+                status="failed",
+                error=str(e),
+            )
+            meta["status"] = "error"
+            self.site_manager.write_metadata(site_id, meta)
+            raise
 
     def retrieve_context(
         self,

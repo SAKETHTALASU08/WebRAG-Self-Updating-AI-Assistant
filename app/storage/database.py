@@ -29,6 +29,7 @@ class SiteDatabase:
                 CREATE TABLE IF NOT EXISTS pages (
                     url TEXT PRIMARY KEY,
                     etag TEXT,
+                    last_modified TEXT,
                     last_crawled TIMESTAMP NOT NULL,
                     title TEXT DEFAULT '',
                     content_type TEXT DEFAULT 'html',
@@ -61,15 +62,30 @@ class SiteDatabase:
                     finished_at TIMESTAMP,
                     pages_discovered INTEGER DEFAULT 0,
                     pages_crawled INTEGER DEFAULT 0,
+                    pages_skipped_304 INTEGER DEFAULT 0,
                     pages_unchanged INTEGER DEFAULT 0,
                     pages_updated INTEGER DEFAULT 0,
                     chunks_added INTEGER DEFAULT 0,
                     chunks_unchanged INTEGER DEFAULT 0,
                     chunks_removed INTEGER DEFAULT 0,
+                    duration_seconds REAL DEFAULT 0.0,
+                    time_saved_seconds REAL DEFAULT 0.0,
                     status TEXT NOT NULL,
                     error TEXT
                 );
             """)
+
+            # Safe migrations for columns in existing databases
+            for table_name, col_name, col_type in [
+                ("pages", "last_modified", "TEXT"),
+                ("crawl_runs", "pages_skipped_304", "INTEGER DEFAULT 0"),
+                ("crawl_runs", "duration_seconds", "REAL DEFAULT 0.0"),
+                ("crawl_runs", "time_saved_seconds", "REAL DEFAULT 0.0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type};")
+                except sqlite3.OperationalError:
+                    pass
 
     def get_page(self, url: str) -> Optional[dict]:
         with self._get_connection() as conn:
@@ -226,25 +242,47 @@ class SiteDatabase:
         content_type: str = "html",
         page_hash: str = "",
         chunk_count: int = 0,
+        last_modified: Optional[str] = None,
         **kwargs,
     ) -> None:
-        """Upsert record in pages(url, etag, last_crawled) with metadata."""
+        """Upsert record in pages(url, etag, last_modified, last_crawled) with metadata."""
         now = last_crawled or kwargs.get("crawled_at") or datetime.now(timezone.utc).isoformat()
+        resolved_last_modified = last_modified or kwargs.get("last_modified")
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO pages (url, etag, last_crawled, title, content_type, page_hash, chunk_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pages (url, etag, last_modified, last_crawled, title, content_type, page_hash, chunk_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     etag = COALESCE(excluded.etag, pages.etag),
+                    last_modified = COALESCE(excluded.last_modified, pages.last_modified),
                     last_crawled = excluded.last_crawled,
                     title = CASE WHEN excluded.title != '' THEN excluded.title ELSE pages.title END,
                     content_type = excluded.content_type,
                     page_hash = excluded.page_hash,
                     chunk_count = excluded.chunk_count
                 """,
-                (url, etag, now, title, content_type, page_hash, chunk_count),
+                (url, etag, resolved_last_modified, now, title, content_type, page_hash, chunk_count),
             )
+
+    def touch_page(self, url: str) -> None:
+        """Update last_crawled timestamp for an unchanged (e.g. 304 Not Modified) page."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute("UPDATE pages SET last_crawled = ? WHERE url = ?", (now, url))
+
+    def get_all_pages_headers(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Return dict of {url: {'etag': etag, 'last_modified': last_modified}} for conditional requests."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT url, etag, last_modified FROM pages")
+            return {
+                row["url"]: {
+                    "etag": row["etag"],
+                    "last_modified": row["last_modified"],
+                }
+                for row in cursor.fetchall()
+            }
 
     def insert_chunk(
         self,
@@ -345,6 +383,9 @@ class SiteDatabase:
         chunks_added: int,
         chunks_unchanged: int,
         chunks_removed: int,
+        pages_skipped_304: int = 0,
+        duration_seconds: float = 0.0,
+        time_saved_seconds: float = 0.0,
         status: str = "completed",
         error: Optional[str] = None,
     ) -> None:
@@ -356,11 +397,14 @@ class SiteDatabase:
                     finished_at = ?,
                     pages_discovered = ?,
                     pages_crawled = ?,
+                    pages_skipped_304 = ?,
                     pages_unchanged = ?,
                     pages_updated = ?,
                     chunks_added = ?,
                     chunks_unchanged = ?,
                     chunks_removed = ?,
+                    duration_seconds = ?,
+                    time_saved_seconds = ?,
                     status = ?,
                     error = ?
                 WHERE id = ?
@@ -369,11 +413,14 @@ class SiteDatabase:
                     now,
                     pages_discovered,
                     pages_crawled,
+                    pages_skipped_304,
                     pages_unchanged,
                     pages_updated,
                     chunks_added,
                     chunks_unchanged,
                     chunks_removed,
+                    duration_seconds,
+                    time_saved_seconds,
                     status,
                     error,
                     run_id,

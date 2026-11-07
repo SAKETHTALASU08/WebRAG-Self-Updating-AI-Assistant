@@ -42,9 +42,6 @@ def _execute_crawl(site_id: str, max_depth: int, max_pages: int) -> None:
         return
 
     root_url = meta["root_url"]
-    db = site_manager.get_database(site_id)
-    run_id = db.record_crawl_start()
-
     crawl_states[site_id] = {
         "is_crawling": True,
         "status": "crawling",
@@ -56,26 +53,10 @@ def _execute_crawl(site_id: str, max_depth: int, max_pages: int) -> None:
         "chunks_added": 0,
         "chunks_unchanged": 0,
         "chunks_removed": 0,
+        "time_saved_seconds": 0.0,
         "error": None,
         "started_at": time.time(),
     }
-
-    meta["status"] = "crawling"
-    site_manager.write_metadata(site_id, meta)
-
-    crawler = WebCrawler(
-        root_url=root_url,
-        max_depth=max_depth,
-        max_pages=max_pages,
-        rate_limit_delay=settings.CRAWL_DELAY_SECONDS,
-    )
-
-    pages_crawled_count = 0
-    pages_updated_count = 0
-    pages_unchanged_count = 0
-    total_chunks_added = 0
-    total_chunks_unchanged = 0
-    total_chunks_removed = 0
 
     def progress_callback(url: str, current: int, total: int):
         if site_id in crawl_states:
@@ -84,63 +65,25 @@ def _execute_crawl(site_id: str, max_depth: int, max_pages: int) -> None:
             crawl_states[site_id]["pages_total"] = total
 
     try:
-        for doc in crawler.crawl_documents(on_page_crawled=progress_callback):
-            pages_crawled_count += 1
-            added, unchanged, removed = rag_pipeline.process_document_incremental(site_id, doc)
-            
-            total_chunks_added += added
-            total_chunks_unchanged += unchanged
-            total_chunks_removed += removed
-
-            if added > 0 or removed > 0:
-                pages_updated_count += 1
-            else:
-                pages_unchanged_count += 1
-
-            if site_id in crawl_states:
-                crawl_states[site_id]["chunks_added"] = total_chunks_added
-                crawl_states[site_id]["chunks_unchanged"] = total_chunks_unchanged
-                crawl_states[site_id]["chunks_removed"] = total_chunks_removed
-                crawl_states[site_id]["pages_updated"] = pages_updated_count
-                crawl_states[site_id]["pages_unchanged"] = pages_unchanged_count
-
-        duration = time.time() - crawl_states[site_id]["started_at"]
-        db.record_crawl_finish(
-            run_id=run_id,
-            pages_discovered=len(crawler.visited_urls),
-            pages_crawled=pages_crawled_count,
-            pages_unchanged=pages_unchanged_count,
-            pages_updated=pages_updated_count,
-            chunks_added=total_chunks_added,
-            chunks_unchanged=total_chunks_unchanged,
-            chunks_removed=total_chunks_removed,
-            status="completed",
+        report = rag_pipeline.crawl_and_index_site(
+            site_id=site_id,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            on_progress=progress_callback,
         )
-
-        meta["status"] = "ready"
-        meta["last_crawled_at"] = datetime.now(timezone.utc).isoformat()
-        site_manager.write_metadata(site_id, meta)
-
-        crawl_states[site_id]["is_crawling"] = False
-        crawl_states[site_id]["status"] = "completed"
-        logger.info(f"Crawl completed for site {site_id} in {duration:.1f}s")
+        if site_id in crawl_states:
+            crawl_states[site_id]["chunks_added"] = report.chunks_added
+            crawl_states[site_id]["chunks_unchanged"] = report.chunks_unchanged
+            crawl_states[site_id]["chunks_removed"] = report.chunks_removed
+            crawl_states[site_id]["pages_updated"] = report.pages_updated
+            crawl_states[site_id]["pages_unchanged"] = report.pages_unchanged
+            crawl_states[site_id]["pages_crawled"] = report.pages_crawled + report.pages_skipped_304
+            crawl_states[site_id]["time_saved_seconds"] = report.time_saved_seconds
+            crawl_states[site_id]["is_crawling"] = False
+            crawl_states[site_id]["status"] = "completed"
 
     except Exception as e:
         logger.error(f"Error during crawl of site {site_id}: {e}", exc_info=True)
-        db.record_crawl_finish(
-            run_id=run_id,
-            pages_discovered=0,
-            pages_crawled=pages_crawled_count,
-            pages_unchanged=pages_unchanged_count,
-            pages_updated=pages_updated_count,
-            chunks_added=total_chunks_added,
-            chunks_unchanged=total_chunks_unchanged,
-            chunks_removed=total_chunks_removed,
-            status="failed",
-            error=str(e),
-        )
-        meta["status"] = "failed"
-        site_manager.write_metadata(site_id, meta)
         if site_id in crawl_states:
             crawl_states[site_id]["is_crawling"] = False
             crawl_states[site_id]["status"] = "failed"
@@ -261,6 +204,8 @@ def get_crawl_status(site_id: str):
                 chunks_added=state.get("chunks_added", 0),
                 chunks_unchanged=state.get("chunks_unchanged", 0),
                 chunks_removed=state.get("chunks_removed", 0),
+                pages_skipped_304=state.get("pages_skipped_304", 0),
+                time_saved_seconds=state.get("time_saved_seconds", 0.0),
                 status="crawling",
             ),
         )
@@ -276,11 +221,14 @@ def get_crawl_status(site_id: str):
             stats=CrawlStats(
                 pages_discovered=last_run.get("pages_discovered", 0),
                 pages_crawled=last_run.get("pages_crawled", 0),
+                pages_skipped_304=last_run.get("pages_skipped_304", 0),
                 pages_unchanged=last_run.get("pages_unchanged", 0),
                 pages_updated=last_run.get("pages_updated", 0),
                 chunks_added=last_run.get("chunks_added", 0),
                 chunks_unchanged=last_run.get("chunks_unchanged", 0),
                 chunks_removed=last_run.get("chunks_removed", 0),
+                duration_seconds=last_run.get("duration_seconds", 0.0),
+                time_saved_seconds=last_run.get("time_saved_seconds", 0.0),
                 status=last_run.get("status", "completed"),
                 error=last_run.get("error"),
             ),
