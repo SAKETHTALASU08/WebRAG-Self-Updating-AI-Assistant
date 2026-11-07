@@ -259,6 +259,7 @@ def query_knowledge_base(site_id: str, req: QueryRequest):
             top_k=top_k,
             similarity_threshold=threshold,
             model=req.model,
+            rerank=req.rerank,
         )
         return response
     except ConnectionError as e:
@@ -270,7 +271,7 @@ def query_knowledge_base(site_id: str, req: QueryRequest):
 
 @router.post("/sites/{site_id}/query/stream")
 def query_knowledge_base_stream(site_id: str, req: QueryRequest):
-    """Server-Sent Events (SSE) streaming response with citations and live tokens."""
+    """Server-Sent Events (SSE) streaming response with sources and live tokens."""
     site = site_manager.get_site(site_id)
     if not site:
         raise HTTPException(status_code=404, detail="Site knowledge base not found")
@@ -279,18 +280,20 @@ def query_knowledge_base_stream(site_id: str, req: QueryRequest):
     threshold = req.similarity_threshold if req.similarity_threshold is not None else settings.SIMILARITY_THRESHOLD
 
     try:
-        citations, token_stream = rag_pipeline.query_stream(
+        sources, token_stream = rag_pipeline.query_stream(
             site_id=site_id,
             query=req.query,
             top_k=top_k,
             similarity_threshold=threshold,
             model=req.model,
+            rerank=req.rerank,
         )
 
         def event_generator():
-            # First event emits citations metadata
-            citations_data = [c.model_dump() for c in citations]
-            yield f"event: citations\ndata: {json.dumps(citations_data)}\n\n"
+            # First event emits sources / citations metadata
+            sources_data = [s.model_dump() for s in sources]
+            yield f"event: sources\ndata: {json.dumps(sources_data)}\n\n"
+            yield f"event: citations\ndata: {json.dumps(sources_data)}\n\n"
 
             # Stream LLM tokens
             for token in token_stream:

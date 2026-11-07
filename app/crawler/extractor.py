@@ -12,10 +12,17 @@ logger = logging.getLogger(__name__)
 class ExtractedSection:
     """Represents a discrete section within an extracted document."""
 
-    def __init__(self, text: str, heading: Optional[str] = None, page_number: Optional[int] = None):
+    def __init__(
+        self,
+        text: str,
+        heading: Optional[str] = None,
+        page_number: Optional[int] = None,
+        page_no: Optional[int] = None,
+    ):
         self.text = text.strip()
         self.heading = heading
-        self.page_number = page_number
+        self.page_number = page_number if page_number is not None else page_no
+        self.page_no = self.page_number
 
     def __repr__(self) -> str:
         return f"<ExtractedSection heading={self.heading!r} page={self.page_number} len={len(self.text)}>"

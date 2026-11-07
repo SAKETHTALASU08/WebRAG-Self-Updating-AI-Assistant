@@ -7,10 +7,11 @@ import requests
 from app.config import settings
 from app.crawler.crawler import CrawlItem, WebCrawler
 from app.crawler.extractor import ContentExtractor, ExtractedDocument
-from app.models.schemas import Citation, CrawlStats, CrawlSummaryReport, QueryResponse
+from app.models.schemas import Citation, CrawlStats, CrawlSummaryReport, QueryResponse, SourceItem
 from app.rag.chunker import DocumentChunk, IncrementalChunker
 from app.rag.embedder import LocalEmbedder
 from app.rag.ollama_client import OllamaClient
+from app.rag.reranker import LocalReranker
 from app.storage.site_manager import SiteManager
 
 logger = logging.getLogger(__name__)
@@ -25,11 +26,13 @@ class RagPipeline:
         embedder: Optional[LocalEmbedder] = None,
         ollama: Optional[OllamaClient] = None,
         chunker: Optional[IncrementalChunker] = None,
+        reranker: Optional[LocalReranker] = None,
     ):
         self.site_manager = site_manager
         self.embedder = embedder or LocalEmbedder.get_instance()
         self.ollama = ollama or OllamaClient()
         self.chunker = chunker or IncrementalChunker()
+        self.reranker = reranker or LocalReranker()
 
     def process_document_incremental(
         self,
@@ -341,22 +344,27 @@ class RagPipeline:
         query: str,
         top_k: int = settings.SIMILARITY_TOP_K,
         similarity_threshold: float = settings.SIMILARITY_THRESHOLD,
-    ) -> Tuple[List[Citation], str]:
-        """Retrieve top chunks for query from the site's isolated index and format prompt context."""
+        rerank: bool = False,
+    ) -> Tuple[List[SourceItem], str]:
+        """
+        Embed question, retrieve top_k from the site's FAISS index, optionally rerank,
+        and build numbered context blocks: [1], [2], ...
+        """
         db = self.site_manager.get_database(site_id)
         vector_store = self.site_manager.get_vector_store(site_id)
 
         if vector_store.total_vectors == 0:
             return [], ""
 
-        # Encode user query
+        # 1. Embed the question
         query_vector = self.embedder.encode(query)[0]
-        results = vector_store.search(query_vector, top_k=top_k)
 
-        citations: List[Citation] = []
-        context_blocks: List[str] = []
+        # 2. Retrieve top_k (or over-sample if reranking is enabled)
+        fetch_k = min(top_k * 3 if rerank else top_k, vector_store.total_vectors)
+        results = vector_store.search(query_vector, top_k=fetch_k)
 
-        for rank, (faiss_id, score) in enumerate(results, start=1):
+        candidates: List[dict] = []
+        for faiss_id, score in results:
             if score < similarity_threshold:
                 continue
 
@@ -364,48 +372,77 @@ class RagPipeline:
             if not chunk_row:
                 continue
 
-            page_info = f", Page {chunk_row['page_number']}" if chunk_row.get("page_number") else ""
-            heading_info = f" > {chunk_row['heading']}" if chunk_row.get("heading") else ""
+            cand = dict(chunk_row)
+            cand["similarity_score"] = float(score)
+            candidates.append(cand)
 
-            citation = Citation(
-                url=chunk_row["url"],
-                title=chunk_row["title"],
-                chunk_index=chunk_row["chunk_index"],
-                page_number=chunk_row.get("page_number"),
-                similarity_score=round(float(score), 4),
-                snippet=chunk_row["text"][:240] + ("..." if len(chunk_row["text"]) > 240 else ""),
+        if not candidates:
+            return [], ""
+
+        # 3. Optionally rerank candidates
+        if rerank and len(candidates) > 1:
+            candidates = self.reranker.rerank(query=query, candidates=candidates, top_k=top_k)
+        else:
+            candidates = candidates[:top_k]
+
+        # 4. Build sources list and prompt with numbered context blocks
+        sources: List[SourceItem] = []
+        context_blocks: List[str] = []
+
+        for idx, cand in enumerate(candidates, start=1):
+            page_no = cand.get("page_no") if cand.get("page_no") is not None else cand.get("page_number")
+            source = SourceItem(
+                url=cand["url"],
+                title=cand.get("title") or "",
+                snippet=cand["text"][:280] + ("..." if len(cand["text"]) > 280 else ""),
+                page_no=page_no,
+                page_number=page_no,
+                chunk_index=cand.get("chunk_index", 0),
+                similarity_score=round(float(cand.get("rerank_score", cand.get("similarity_score", 0.0))), 4),
             )
-            citations.append(citation)
+            sources.append(source)
+
+            page_info = f" (Page: {page_no})" if page_no is not None else ""
+            title_info = f"Title: {cand.get('title')} | " if cand.get("title") else ""
+            heading_info = f" > {cand['heading']}" if cand.get("heading") else ""
 
             block = (
-                f"[Source {rank} | URL: {chunk_row['url']}{page_info}{heading_info}]\n"
-                f"{chunk_row['text']}"
+                f"[{idx}] {title_info}URL: {cand['url']}{page_info}{heading_info}\n"
+                f"{cand['text']}"
             )
             context_blocks.append(block)
 
         formatted_context = "\n\n".join(context_blocks)
-        return citations, formatted_context
+        return sources, formatted_context
 
     def _build_rag_prompt(self, query: str, context: str) -> Tuple[str, str]:
-        """Construct system prompt and user prompt strictly requiring citations."""
+        """
+        Construct system prompt and user prompt strictly requiring:
+        - Answers only from context
+        - Return 'I couldn't find this on the website' when unsupported
+        - Cite sources as [1], [2]
+        """
         system_prompt = (
-            "You are WebRAG, an accurate AI assistant that answers questions using ONLY the provided website context.\n"
-            "Rules you must strictly follow:\n"
-            "1. Ground every statement strictly in the provided context.\n"
-            "2. If the context does not contain enough information to answer, state clearly: "
-            "'I cannot find the answer to this question in the indexed website content.'\n"
-            "3. You MUST cite the source URLs for facts. Cite them in markdown format like [Source Title](URL) "
-            "or [URL] directly where relevant.\n"
-            "4. Do NOT make up URLs or assume facts not present in the excerpts."
+            "You are WebRAG, an accurate AI assistant that answers questions using ONLY the provided website context.\n\n"
+            "Strict Rules:\n"
+            "1. Answer the question using ONLY the direct facts contained in the numbered context blocks below. "
+            "Never assume, extrapolate, speculate, or bring in outside knowledge.\n"
+            "2. If the context does not contain enough information to answer the question, or if the question is unsupported, "
+            "you MUST reply with EXACTLY:\n"
+            "I couldn't find this on the website\n"
+            "Do not apologize, fabricate explanations, or mention other topics.\n"
+            "3. Cite all factual statements using bracketed numbers corresponding to the context blocks, e.g. [1], [2], or [1][2]. "
+            "Every factual sentence or claim must cite its source block.\n"
+            "4. Do not invent citations or include markdown links. Use only [1], [2] notation."
         )
 
         user_prompt = (
-            f"Indexed Website Context:\n"
+            f"Numbered Context Blocks:\n"
             f"---------------------\n"
             f"{context}\n"
             f"---------------------\n\n"
-            f"User Question: {query}\n\n"
-            f"Provide a comprehensive, well-structured answer with exact citations to the source URLs:"
+            f"Question: {query}\n\n"
+            f"Answer (cite sources as [1], [2]):"
         )
 
         return system_prompt, user_prompt
@@ -417,20 +454,26 @@ class RagPipeline:
         top_k: int = settings.SIMILARITY_TOP_K,
         similarity_threshold: float = settings.SIMILARITY_THRESHOLD,
         model: Optional[str] = None,
+        rerank: bool = False,
     ) -> QueryResponse:
-        """Execute end-to-end RAG query with Ollama generation."""
+        """
+        Execute end-to-end RAG query:
+        Embed question -> search FAISS -> optionally rerank -> build numbered prompt -> call Ollama -> return {answer, sources}.
+        """
         start_time = time.time()
-        citations, context = self.retrieve_context(
+        sources, context = self.retrieve_context(
             site_id=site_id,
             query=query,
             top_k=top_k,
             similarity_threshold=similarity_threshold,
+            rerank=rerank,
         )
 
-        if not context:
+        if not context or not sources:
             latency_ms = (time.time() - start_time) * 1000
             return QueryResponse(
-                answer="No relevant content found in this knowledge base for your query. Try rephrasing or check if the website has been crawled.",
+                answer="I couldn't find this on the website",
+                sources=[],
                 citations=[],
                 latency_ms=round(latency_ms, 2),
                 chunks_retrieved=0,
@@ -442,9 +485,10 @@ class RagPipeline:
 
         return QueryResponse(
             answer=answer.strip(),
-            citations=citations,
+            sources=sources,
+            citations=sources,
             latency_ms=round(latency_ms, 2),
-            chunks_retrieved=len(citations),
+            chunks_retrieved=len(sources),
         )
 
     def query_stream(
@@ -454,20 +498,22 @@ class RagPipeline:
         top_k: int = settings.SIMILARITY_TOP_K,
         similarity_threshold: float = settings.SIMILARITY_THRESHOLD,
         model: Optional[str] = None,
-    ) -> Tuple[List[Citation], Generator[str, None, None]]:
-        """Streaming version returning citations and a token generator."""
-        citations, context = self.retrieve_context(
+        rerank: bool = False,
+    ) -> Tuple[List[SourceItem], Generator[str, None, None]]:
+        """Streaming version returning sources and an incremental token generator from Ollama."""
+        sources, context = self.retrieve_context(
             site_id=site_id,
             query=query,
             top_k=top_k,
             similarity_threshold=similarity_threshold,
+            rerank=rerank,
         )
 
-        if not context:
+        if not context or not sources:
             def empty_gen():
-                yield "No relevant content found in this knowledge base for your query. Try rephrasing or check if the website has been crawled."
+                yield "I couldn't find this on the website"
             return [], empty_gen()
 
         system_prompt, user_prompt = self._build_rag_prompt(query, context)
         token_stream = self.ollama.generate_stream(prompt=user_prompt, system=system_prompt, model=model)
-        return citations, token_stream
+        return sources, token_stream
