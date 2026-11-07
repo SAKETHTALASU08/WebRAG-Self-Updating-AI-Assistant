@@ -8,8 +8,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.crawler.crawler import WebCrawler
 from app.models.schemas import (
+    ChatRequest,
     ChunkInspection,
     Citation,
     CrawlStats,
@@ -18,13 +18,14 @@ from app.models.schemas import (
     QueryResponse,
     SiteCreateRequest,
     SiteSummary,
+    SourceItem,
 )
 from app.rag.pipeline import RagPipeline
 from app.storage.site_manager import SiteManager
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api")
+router = APIRouter()
 
 # Shared singletons
 site_manager = SiteManager()
@@ -92,11 +93,17 @@ def _execute_crawl(site_id: str, max_depth: int, max_pages: int) -> None:
 
 # ---------------- API Endpoints ---------------- #
 
-@router.get("/health")
+@router.get(
+    "/health",
+    summary="System Health & LLM Status",
+    description="Check system health, Ollama LLM service connectivity, and sentence-transformers device.",
+    tags=["System"],
+)
 def get_health():
     """System health and local LLM connectivity check."""
     ollama_alive = rag_pipeline.ollama.check_health()
     available_models = rag_pipeline.ollama.list_models() if ollama_alive else []
+
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -109,18 +116,31 @@ def get_health():
         "embedding": {
             "model": settings.EMBEDDING_MODEL_NAME,
             "dimension": settings.EMBEDDING_DIM,
-            "device": rag_pipeline.embedder._device,
+            "device": getattr(rag_pipeline.embedder, "_device", "cpu"),
         },
     }
 
 
-@router.get("/sites", response_model=List[SiteSummary])
+@router.get(
+    "/sites",
+    response_model=List[SiteSummary],
+    summary="List All Knowledge Bases",
+    description="Retrieve a list of all configured website knowledge bases and their indexing stats.",
+    tags=["Sites"],
+)
 def list_sites():
     """List all configured website knowledge bases."""
     return site_manager.list_sites()
 
 
-@router.post("/sites", response_model=SiteSummary, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/sites",
+    response_model=SiteSummary,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Site & Start Background Crawl",
+    description="Register root URL, create isolated knowledge base folder with SQLite and FAISS, and trigger crawl+index in the background.",
+    tags=["Sites"],
+)
 def create_site(request: SiteCreateRequest, background_tasks: BackgroundTasks):
     """Register a new website root URL, create isolated knowledge base, and trigger initial crawl."""
     summary = site_manager.create_or_get_site(
@@ -139,7 +159,13 @@ def create_site(request: SiteCreateRequest, background_tasks: BackgroundTasks):
     return summary
 
 
-@router.get("/sites/{site_id}", response_model=SiteSummary)
+@router.get(
+    "/sites/{site_id}",
+    response_model=SiteSummary,
+    summary="Get Site Details",
+    description="Retrieve metadata, crawl status, and statistics for a single website knowledge base.",
+    tags=["Sites"],
+)
 def get_site(site_id: str):
     """Retrieve details and statistics for a specific website knowledge base."""
     site = site_manager.get_site(site_id)
@@ -148,37 +174,65 @@ def get_site(site_id: str):
     return site
 
 
-@router.delete("/sites/{site_id}", status_code=status.HTTP_200_OK)
+@router.delete(
+    "/sites/{site_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete Site Knowledge Base",
+    description="Permanently deletes the site directory, SQLite database, and FAISS index.",
+    tags=["Sites"],
+)
 def delete_site(site_id: str):
     """Delete an isolated knowledge base and all its crawled data/vectors."""
     success = site_manager.delete_site(site_id)
     if not success:
         raise HTTPException(status_code=404, detail="Site not found or could not be deleted")
     crawl_states.pop(site_id, None)
-    return {"message": f"Site {site_id} deleted successfully"}
+    return {"message": f"Site {site_id} deleted successfully", "site_id": site_id}
 
 
-@router.post("/sites/{site_id}/crawl", status_code=status.HTTP_202_ACCEPTED)
-def trigger_crawl(site_id: str, background_tasks: BackgroundTasks):
-    """Trigger an incremental crawl/update for the site (SHA-256 chunk-level change detection)."""
+@router.post(
+    "/sites/{site_id}/refresh",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Trigger Incremental Re-Crawl & Update",
+    description="Trigger an incremental re-crawl using conditional requests (ETag/Last-Modified) and SHA-256 chunk-level change detection.",
+    tags=["Crawl & Refresh"],
+)
+@router.post("/sites/{site_id}/crawl", status_code=status.HTTP_202_ACCEPTED, include_in_schema=False)
+def refresh_site(site_id: str, background_tasks: BackgroundTasks):
+    """Trigger an incremental update for the website knowledge base."""
     site = site_manager.get_site(site_id)
     if not site:
         raise HTTPException(status_code=404, detail="Site knowledge base not found")
 
     state = crawl_states.get(site_id)
     if state and state.get("is_crawling"):
-        return {"message": "Crawl already in progress", "site_id": site_id}
+        return {
+            "message": "Crawl already in progress",
+            "site_id": site_id,
+            "status": "crawling",
+        }
 
     meta = site_manager.read_metadata(site_id) or {}
     max_depth = meta.get("max_depth", settings.MAX_CRAWL_DEPTH)
     max_pages = meta.get("max_pages", settings.MAX_CRAWL_PAGES)
 
     background_tasks.add_task(_execute_crawl, site_id, max_depth, max_pages)
-    return {"message": "Incremental crawl initiated", "site_id": site_id}
+    return {
+        "message": "Incremental refresh initiated",
+        "site_id": site_id,
+        "status": "accepted",
+    }
 
 
-@router.get("/sites/{site_id}/crawl/status", response_model=CrawlStatusResponse)
-def get_crawl_status(site_id: str):
+@router.get(
+    "/sites/{site_id}/status",
+    response_model=CrawlStatusResponse,
+    summary="Get Site Crawl & Indexing Status",
+    description="Check the real-time background crawl status, current URL, counts, or the last completed run stats.",
+    tags=["Crawl & Refresh"],
+)
+@router.get("/sites/{site_id}/crawl/status", response_model=CrawlStatusResponse, include_in_schema=False)
+def get_site_status(site_id: str):
     """Check the real-time progress or last result of a crawl for this site."""
     site = site_manager.get_site(site_id)
     if not site:
@@ -242,7 +296,80 @@ def get_crawl_status(site_id: str):
     )
 
 
-@router.post("/sites/{site_id}/query", response_model=QueryResponse)
+@router.post(
+    "/sites/{site_id}/chat",
+    summary="Chat With Website (Streaming Answer + Sources)",
+    description="Stream answers strictly grounded in website context blocks, citing [1], [2], with source URLs and snippets.",
+    tags=["Chat & Query"],
+)
+def chat_with_site(site_id: str, req: ChatRequest):
+    """
+    Stream answer tokens and sources metadata for a user question.
+    Emits text/event-stream:
+    - event: sources (JSON array of {url, title, snippet, page_no})
+    - event: token ({"token": string})
+    - event: done ({})
+    """
+    site = site_manager.get_site(site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="Site knowledge base not found")
+
+    top_k = req.top_k or settings.SIMILARITY_TOP_K
+    threshold = req.similarity_threshold if req.similarity_threshold is not None else settings.SIMILARITY_THRESHOLD
+
+    try:
+        sources, token_stream = rag_pipeline.query_stream(
+            site_id=site_id,
+            query=req.query,
+            top_k=top_k,
+            similarity_threshold=threshold,
+            model=req.model,
+            rerank=req.rerank,
+        )
+
+        def event_generator():
+            # First event emits sources list with exact required schema {url, title, snippet, page_no}
+            sources_payload = [
+                {
+                    "url": s.url,
+                    "title": s.title,
+                    "snippet": s.snippet,
+                    "page_no": s.page_no,
+                }
+                for s in sources
+            ]
+            yield f"event: sources\ndata: {json.dumps(sources_payload)}\n\n"
+            yield f"event: citations\ndata: {json.dumps(sources_payload)}\n\n"
+
+            for token in token_stream:
+                payload = json.dumps({"token": token})
+                yield f"event: token\ndata: {payload}\n\n"
+
+            yield "event: done\ndata: {}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except ConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"Chat streaming error for site {site_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/sites/{site_id}/query",
+    response_model=QueryResponse,
+    summary="Query Knowledge Base (JSON)",
+    description="Non-streaming RAG query returning {answer, sources:[{url, title, snippet, page_no}]}.",
+    tags=["Chat & Query"],
+)
 def query_knowledge_base(site_id: str, req: QueryRequest):
     """Ask a question against the site's isolated vector knowledge base."""
     site = site_manager.get_site(site_id)
@@ -269,48 +396,24 @@ def query_knowledge_base(site_id: str, req: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/sites/{site_id}/query/stream")
+@router.post(
+    "/sites/{site_id}/query/stream",
+    summary="Streaming Query Alias",
+    include_in_schema=False,
+)
 def query_knowledge_base_stream(site_id: str, req: QueryRequest):
-    """Server-Sent Events (SSE) streaming response with sources and live tokens."""
-    site = site_manager.get_site(site_id)
-    if not site:
-        raise HTTPException(status_code=404, detail="Site knowledge base not found")
-
-    top_k = req.top_k or settings.SIMILARITY_TOP_K
-    threshold = req.similarity_threshold if req.similarity_threshold is not None else settings.SIMILARITY_THRESHOLD
-
-    try:
-        sources, token_stream = rag_pipeline.query_stream(
-            site_id=site_id,
-            query=req.query,
-            top_k=top_k,
-            similarity_threshold=threshold,
-            model=req.model,
-            rerank=req.rerank,
-        )
-
-        def event_generator():
-            # First event emits sources / citations metadata
-            sources_data = [s.model_dump() for s in sources]
-            yield f"event: sources\ndata: {json.dumps(sources_data)}\n\n"
-            yield f"event: citations\ndata: {json.dumps(sources_data)}\n\n"
-
-            # Stream LLM tokens
-            for token in token_stream:
-                payload = json.dumps({"token": token})
-                yield f"event: token\ndata: {payload}\n\n"
-
-            yield "event: done\ndata: {}\n\n"
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-    except ConnectionError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Stream error for site {site_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    """Backward compatibility alias for /sites/{site_id}/chat."""
+    chat_req = ChatRequest(**req.model_dump())
+    return chat_with_site(site_id, chat_req)
 
 
-@router.get("/sites/{site_id}/chunks", response_model=List[ChunkInspection])
+@router.get(
+    "/sites/{site_id}/chunks",
+    response_model=List[ChunkInspection],
+    summary="Inspect Site Chunks",
+    description="Inspect stored chunks and their SHA-256 hashes for transparency.",
+    tags=["Inspection"],
+)
 def get_site_chunks(site_id: str, limit: int = Query(50, ge=1, le=200)):
     """Inspect stored chunks and their SHA-256 hashes for transparency."""
     site = site_manager.get_site(site_id)

@@ -1,13 +1,31 @@
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel, Field, HttpUrl
+from urllib.parse import urlparse
+from pydantic import BaseModel, Field, field_validator
 
 
 class SiteCreateRequest(BaseModel):
-    root_url: str = Field(..., description="Root URL to crawl and build the knowledge base from")
+    root_url: str = Field(
+        ...,
+        description="Root URL of the website to crawl and build the knowledge base from",
+        examples=["https://docs.python.org/3/"],
+    )
     name: Optional[str] = Field(None, description="Optional friendly name for this knowledge base")
     max_depth: Optional[int] = Field(3, ge=1, le=10, description="Max crawling depth from root")
     max_pages: Optional[int] = Field(50, ge=1, le=500, description="Max pages to crawl")
+
+    @field_validator("root_url")
+    @classmethod
+    def validate_root_url(cls, v: str) -> str:
+        clean = v.strip()
+        if not clean:
+            raise ValueError("root_url cannot be empty.")
+        parsed = urlparse(clean)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ValueError("root_url must start with http:// or https://")
+        if not parsed.netloc:
+            raise ValueError("root_url must include a valid domain or host name.")
+        return clean
 
 
 class SiteSummary(BaseModel):
@@ -86,11 +104,29 @@ Citation = SourceItem
 
 
 class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="User question")
-    top_k: Optional[int] = Field(None, ge=1, le=20)
-    similarity_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="User question to answer strictly using website context",
+        examples=["How do I authenticate with the API?"],
+    )
+    top_k: Optional[int] = Field(None, ge=1, le=50, description="Max context chunks to retrieve")
+    similarity_threshold: Optional[float] = Field(None, ge=-1.0, le=1.0, description="Minimum similarity score")
     model: Optional[str] = Field(None, description="Optional override for Ollama model")
     rerank: bool = Field(False, description="Optionally apply BM25/hybrid reranking to retrieved chunks")
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, v: str) -> str:
+        clean = v.strip()
+        if not clean:
+            raise ValueError("query cannot be blank.")
+        return clean
+
+
+class ChatRequest(QueryRequest):
+    """Request payload for /sites/{id}/chat streaming endpoint."""
+    pass
 
 
 class QueryResponse(BaseModel):
