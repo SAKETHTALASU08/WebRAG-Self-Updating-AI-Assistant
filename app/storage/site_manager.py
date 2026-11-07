@@ -165,7 +165,7 @@ class SiteManager:
         if vec_store is not None:
             import faiss
             base_index = faiss.IndexFlatIP(vec_store.dimension)
-            vec_store.index = faiss.IndexIDMap2(base_index)
+            vec_store.index = faiss.IndexIDMap(base_index)
 
         self._db_cache.pop(site_id, None)
 

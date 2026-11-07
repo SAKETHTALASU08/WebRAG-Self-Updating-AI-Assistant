@@ -28,6 +28,10 @@ class DummyEmbedder:
             vectors.append(v)
         return np.vstack(vectors) if vectors else np.empty((0, self.dim), dtype=np.float32)
 
+    def embed_chunks(self, chunks, batch_size=32):
+        texts = [c.text if hasattr(c, "text") else c["text"] for c in chunks]
+        return self.encode(texts, batch_size=batch_size)
+
 
 def test_incremental_indexing_workflow(mock_site_manager: SiteManager):
     site = mock_site_manager.create_or_get_site("https://acme.org/handbook")

@@ -169,6 +169,54 @@ class SiteDatabase:
         """Backward compatibility alias for get_chunk_by_embedding_id."""
         return self.get_chunk_by_embedding_id(faiss_id)
 
+    def get_chunk_by_chunk_id(self, chunk_id: str) -> Optional[dict]:
+        """Retrieve full chunk record by content chunk_id."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT 
+                    chunk_id, chunk_id AS id,
+                    site_id,
+                    url,
+                    page_no, page_no AS page_number,
+                    heading,
+                    text,
+                    hash, hash AS chunk_hash,
+                    embedding_id, embedding_id AS faiss_id,
+                    status,
+                    updated_at, updated_at AS created_at
+                FROM chunks 
+                WHERE chunk_id = ?
+                """,
+                (chunk_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_chunk_id_by_faiss_id(self, faiss_id: int) -> Optional[str]:
+        """Map FAISS integer embedding ID to SHA-256 chunk_id."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chunk_id FROM chunks WHERE embedding_id = ?", (faiss_id,))
+            row = cursor.fetchone()
+            return row["chunk_id"] if row else None
+
+    def get_faiss_id_by_chunk_id(self, chunk_id: str) -> Optional[int]:
+        """Map SHA-256 chunk_id to FAISS integer embedding ID."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT embedding_id FROM chunks WHERE chunk_id = ?", (chunk_id,))
+            row = cursor.fetchone()
+            return int(row["embedding_id"]) if row else None
+
+    def get_all_faiss_mappings(self) -> Dict[int, str]:
+        """Return full mapping of {faiss_id: chunk_id} stored in SQLite."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT embedding_id, chunk_id FROM chunks ORDER BY embedding_id ASC")
+            return {int(row["embedding_id"]): row["chunk_id"] for row in cursor.fetchall()}
+
     def upsert_page(
         self,
         url: str,
@@ -252,6 +300,19 @@ class SiteDatabase:
 
             cursor.execute(f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", chunk_ids)
             return embedding_ids
+
+    def delete_chunks_by_faiss_ids(self, faiss_ids: List[int]) -> List[str]:
+        """Delete chunks by embedding_id (FAISS ID) and return their chunk_ids."""
+        if not faiss_ids:
+            return []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in faiss_ids)
+            cursor.execute(f"SELECT chunk_id FROM chunks WHERE embedding_id IN ({placeholders})", faiss_ids)
+            chunk_ids = [row["chunk_id"] for row in cursor.fetchall()]
+
+            cursor.execute(f"DELETE FROM chunks WHERE embedding_id IN ({placeholders})", faiss_ids)
+            return chunk_ids
 
     def get_max_embedding_id(self) -> int:
         with self._get_connection() as conn:

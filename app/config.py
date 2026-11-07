@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     # Embedding Configuration (Local sentence-transformers)
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
     EMBEDDING_DIM: int = 384
+    EMBEDDING_BATCH_SIZE: int = 32
     
     # Ollama Configuration (Local LLM)
     OLLAMA_HOST: str = "http://localhost:11434"

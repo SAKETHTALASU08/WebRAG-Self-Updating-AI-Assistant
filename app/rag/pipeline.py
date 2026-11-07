@@ -69,7 +69,7 @@ class RagPipeline:
         chunks_removed = 0
         if stale_chunk_ids:
             removed_faiss_ids = db.delete_chunks_by_ids(stale_chunk_ids)
-            vector_store.remove_vectors(removed_faiss_ids)
+            vector_store.remove(removed_faiss_ids)
             chunks_removed = len(removed_faiss_ids)
             logger.info(f"Removed {chunks_removed} obsolete chunks for {doc.url}")
 
@@ -87,8 +87,11 @@ class RagPipeline:
         # 5. Embed and store new/modified chunks
         chunks_added = 0
         if chunks_to_embed:
-            texts = [c.text for c in chunks_to_embed]
-            vectors = self.embedder.encode(texts)
+            if hasattr(self.embedder, "embed_chunks"):
+                vectors = self.embedder.embed_chunks(chunks_to_embed, batch_size=settings.EMBEDDING_BATCH_SIZE)
+            else:
+                texts = [c.text for c in chunks_to_embed]
+                vectors = self.embedder.encode(texts, batch_size=settings.EMBEDDING_BATCH_SIZE)
 
             current_max_faiss_id = db.get_max_faiss_id()
             assigned_faiss_ids: List[int] = []
@@ -109,7 +112,7 @@ class RagPipeline:
                     status="active",
                 )
 
-            vector_store.add_vectors(assigned_faiss_ids, vectors)
+            vector_store.add(assigned_faiss_ids, vectors)
             chunks_added = len(chunks_to_embed)
             logger.info(f"Embedded and saved {chunks_added} new chunks for {doc.url}")
 
